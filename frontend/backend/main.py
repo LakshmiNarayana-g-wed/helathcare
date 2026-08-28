@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -6,6 +6,10 @@ import datetime
 import os
 import threading
 import time
+from dotenv import load_dotenv
+
+# Load local environment variables from .env file
+load_dotenv()
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -243,13 +247,29 @@ def init_db():
 
 app = FastAPI(title="Healthcare Coordination Agent Backend")
 
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_origin_regex=r"https://.*\.ngrok-free\.dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_proxy_headers(request: Request, call_next):
+    # Adjust scheme based on X-Forwarded-Proto header for proxy support (e.g. ngrok)
+    if request.headers.get("x-forwarded-proto") == "https":
+        request.scope["scheme"] = "https"
+    response = await call_next(request)
+    return response
 
 @app.on_event("startup")
 def startup_event():
@@ -1984,21 +2004,23 @@ def send_sms_via_twilio(to_number: str, body: str):
     Sends an SMS via Twilio using credentials from the environment.
     Falls back to mock logs if Twilio is not configured.
     """
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID") or ""
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN") or ""
-    from_number = os.getenv("TWILIO_PHONE_NUMBER") or "+17372212163"
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
 
     # Try formatting to_number with country code +91 if it's 10 digits
     dest_number = to_number.strip()
     if len(dest_number) == 10 and dest_number.isdigit():
         dest_number = f"+91{dest_number}"
 
-    if not all([account_sid, auth_token, from_number]):
-        print(f"[MOCK SMS] Twilio not configured. Message to {dest_number}: '{body}'")
-        return "MOCK-SID-12345"
+    if not account_sid or not auth_token or not from_number:
+        safe_body = body.encode('ascii', errors='backslashreplace').decode('ascii')
+        print(f"[MOCK SMS] Twilio not configured. Message to {dest_number}: '{safe_body}'")
+        return {"success": True, "sid": "MOCK-SID-12345", "mock": True}
 
     try:
         from twilio.rest import Client
+        from twilio.base.exceptions import TwilioRestException
         client = Client(account_sid, auth_token)
         message = client.messages.create(
             body=body,
@@ -2006,25 +2028,33 @@ def send_sms_via_twilio(to_number: str, body: str):
             to=dest_number
         )
         print(f"[SMS SENT] Twilio Message SID: {message.sid} to {dest_number}")
-        return message.sid
+        return {"success": True, "sid": message.sid, "mock": False}
+    except TwilioRestException as e:
+        # e.msg contains only the safe descriptive error message without sensitive secrets
+        error_msg = f"Twilio API error (status {e.status}): {e.msg} (Twilio Error Code: {e.code})"
+        print(f"[SMS TWILIO ERROR] Failed to send Twilio SMS to {dest_number}: {error_msg}")
+        return {"success": False, "error": error_msg, "code": e.code, "status": e.status}
     except Exception as e:
-        print(f"[SMS ERROR] Failed to send Twilio SMS to {dest_number}: {e}")
-        return None
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"[SMS ERROR] Failed to send Twilio SMS to {dest_number}: {error_msg}")
+        return {"success": False, "error": error_msg}
 
 
 # ----------------- Medication Reminders REST Endpoints -----------------
 
-@app.post("/api/pharmacy/medication-reminders")
-@app.post("/api/pharmacy/medication-reminders/")
-def create_medication_reminder(payload: MedicationReminderRequest, db: Session = Depends(get_db)):
-    # Validate scheduled time is within the allowed slots
-    time_str = payload.scheduled_time.strip()
-    period = payload.period.upper()
+class MedicationReminderUpdate(BaseModel):
+    period: Optional[str] = None
+    scheduled_time: Optional[str] = None
+    phone_number: Optional[str] = None
+    is_active: Optional[bool] = None
+
+def validate_reminder_time(period: str, time_str: str):
+    time_str = time_str.strip()
+    period = period.upper()
     
-    # Validation windows
-    # Morning: 6.00 to 11.00
-    # Afternoon: 12.00 to 3.00 (15:00)
-    # Evening: 7.00 to 11.00 (19:00 to 23:00)
+    # Morning: 6:00 AM–11:00 AM
+    # Afternoon: 12:00 PM–3:00 PM (15:00)
+    # Evening: 7:00 PM–11:00 PM (19:00 to 23:00)
     if period == "MORNING":
         if not ("06:00" <= time_str <= "11:00"):
             raise HTTPException(
@@ -2045,21 +2075,26 @@ def create_medication_reminder(payload: MedicationReminderRequest, db: Session =
             )
     else:
         raise HTTPException(status_code=400, detail="Invalid period selected.")
+    return period, time_str
 
-    # Create new reminder
+@app.post("/api/pharmacy/medication-reminders")
+@app.post("/api/pharmacy/medication-reminders/")
+def create_medication_reminder(payload: MedicationReminderRequest, db: Session = Depends(get_db)):
+    period, time_str = validate_reminder_time(payload.period, payload.scheduled_time)
+    
     reminder = MedicationReminder(
         patient_id="AN01", # mock default patient ID
         period=period,
         scheduled_time=time_str,
-        phone_number=payload.phone_number
+        phone_number=payload.phone_number,
+        is_active=True
     )
     db.add(reminder)
     db.commit()
     db.refresh(reminder)
 
-    # Immediately send a confirmation SMS
-    confirm_msg = f"Healora: Your medicine reminder is set at {time_str} ({payload.period.lower()}). We will text you a 'Take your Medicine' alert."
-    send_sms_via_twilio(payload.phone_number, confirm_msg)
+    # Immediately send the required SMS
+    send_sms_via_twilio(payload.phone_number, "Take your Medicine 💊")
 
     return {
         "success": True,
@@ -2073,11 +2108,9 @@ def create_medication_reminder(payload: MedicationReminderRequest, db: Session =
         }
     }
 
-
 @app.get("/api/pharmacy/medication-reminders")
 @app.get("/api/pharmacy/medication-reminders/")
 def get_medication_reminders(db: Session = Depends(get_db)):
-    # Return active reminders formatted for the frontend Patient.jsx layout
     reminders = db.query(MedicationReminder).filter(MedicationReminder.patient_id == "AN01").all()
     results = []
     for r in reminders:
@@ -2095,17 +2128,108 @@ def get_medication_reminders(db: Session = Depends(get_db)):
         })
     return results
 
+@app.get("/api/pharmacy/medication-reminders/{id}")
+@app.get("/api/pharmacy/medication-reminders/{id}/")
+def get_medication_reminder_by_id(id: int, db: Session = Depends(get_db)):
+    reminder = db.query(MedicationReminder).filter(MedicationReminder.id == id).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Medication reminder not found")
+    return {
+        "id": reminder.id,
+        "period": reminder.period,
+        "scheduled_time": reminder.scheduled_time,
+        "phone_number": reminder.phone_number,
+        "is_active": reminder.is_active,
+        "prescription_details": {
+            "medicine_details": {
+                "name": "Medication"
+            }
+        }
+    }
+
+@app.put("/api/pharmacy/medication-reminders/{id}")
+@app.put("/api/pharmacy/medication-reminders/{id}/")
+def update_medication_reminder(id: int, payload: MedicationReminderUpdate, db: Session = Depends(get_db)):
+    reminder = db.query(MedicationReminder).filter(MedicationReminder.id == id).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Medication reminder not found")
+    
+    sms_triggered = False
+    
+    if payload.period is not None:
+        reminder.period = payload.period.upper()
+    if payload.scheduled_time is not None:
+        reminder.scheduled_time = payload.scheduled_time.strip()
+        sms_triggered = True
+    if payload.phone_number is not None:
+        reminder.phone_number = payload.phone_number
+        sms_triggered = True
+    if payload.is_active is not None:
+        reminder.is_active = payload.is_active
+
+    # Validate time/period constraints
+    validate_reminder_time(reminder.period, reminder.scheduled_time)
+    
+    db.add(reminder)
+    db.commit()
+    db.refresh(reminder)
+
+    if sms_triggered:
+        send_sms_via_twilio(reminder.phone_number, "Take your Medicine 💊")
+
+    return {
+        "success": True,
+        "message": "Reminder updated successfully",
+        "reminder": {
+            "id": reminder.id,
+            "period": reminder.period,
+            "scheduled_time": reminder.scheduled_time,
+            "phone_number": reminder.phone_number,
+            "is_active": reminder.is_active
+        }
+    }
+
+@app.delete("/api/pharmacy/medication-reminders/{id}")
+@app.delete("/api/pharmacy/medication-reminders/{id}/")
+def delete_medication_reminder(id: int, db: Session = Depends(get_db)):
+    reminder = db.query(MedicationReminder).filter(MedicationReminder.id == id).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Medication reminder not found")
+    db.delete(reminder)
+    db.commit()
+    return {"success": True, "message": "Reminder deleted successfully"}
+
+
+# ----------------- Twilio Webhook Endpoint -----------------
+
+@app.post("/api/twilio/webhook")
+@app.post("/api/twilio/webhook/")
+def twilio_webhook():
+    """
+    Twilio messaging webhook endpoint. Returns a standard empty TwiML response.
+    """
+    twiml = "<Response></Response>"
+    return Response(content=twiml, media_type="application/xml")
+
 
 # ----------------- SMS Test Endpoint -----------------
 
 @app.post("/api/ai/send-test-sms")
 @app.post("/api/ai/send-test-sms/")
 def send_test_sms(payload: TestSMSRequest):
-    sid = send_sms_via_twilio(payload.phone_number, payload.message)
-    if sid:
-        return {"success": True, "message_sid": sid}
+    res_sms = send_sms_via_twilio(payload.phone_number, payload.message)
+    if res_sms["success"]:
+        return {
+            "success": True,
+            "message_sid": res_sms["sid"],
+            "is_mock": res_sms.get("mock", False)
+        }
     else:
-        raise HTTPException(status_code=500, detail="Failed to send SMS. Check logs.")
+        # Pass the detailed Twilio error code and message back to the client
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to send SMS: {res_sms.get('error')}"
+        )
 
 
 # ----------------- Background Reminder Worker Daemon -----------------
@@ -2123,11 +2247,11 @@ def check_and_send_reminders_loop():
             due_reminders = db.query(MedicationReminder).filter(
                 MedicationReminder.is_active == True,
                 MedicationReminder.scheduled_time == now_str,
-                (MedicationReminder.last_sent_on != today_str) | (MedicationReminder.last_sent_on == None)
+                (MedicationReminder.last_sent_on != today_str) | (MedicationReminder.last_sent_on.is_(None))
             ).all()
             
             for reminder in due_reminders:
-                body = f"Take your Medicine. This is your scheduled {reminder.period.lower()} reminder at {reminder.scheduled_time}."
+                body = "Take your Medicine 💊"
                 send_sms_via_twilio(reminder.phone_number, body)
                 reminder.last_sent_on = today_str
                 db.add(reminder)
@@ -2137,7 +2261,11 @@ def check_and_send_reminders_loop():
         except Exception as e:
             print(f"[REMINDER WORKER ERROR] {e}")
         
-        # Sleep for 30 seconds to prevent skipping or double-processing
-        time.sleep(30)
+        # Sleep until the start of the next minute to avoid duplicate execution in the same minute
+        now = datetime.datetime.now()
+        sleep_seconds = 60 - now.second
+        if sleep_seconds < 1:
+            sleep_seconds = 60
+        time.sleep(sleep_seconds)
 
 
