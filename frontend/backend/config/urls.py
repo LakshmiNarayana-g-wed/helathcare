@@ -3,6 +3,9 @@ from django.urls import path, include, re_path
 from rest_framework import permissions
 from django.http import JsonResponse
 from django.views.generic import TemplateView
+from django.conf import settings
+from django.views.static import serve
+import os
 
 # Simple API root view
 def api_root(request):
@@ -45,6 +48,13 @@ urlpatterns = [
     path('api/coordination/', include('coordination.urls')),
     path('api/ai/', include('ai_agent.urls')),
     path('api/audit-logs/', include('audit_logs.urls')),
+    
+    # Serve root-level static assets (like doctor/medicine public images) from the dist folder
+    re_path(
+        r'^(?P<path>.*\.(js|css|png|jpg|jpeg|svg|gif|webp|ico))$',
+        serve,
+        {'document_root': os.path.join(settings.BASE_DIR, '..', 'dist')}
+    ),
     
     # Catch-all route to serve the SPA index.html for frontend sub-routing (e.g. /patients, /doctors)
     re_path(r'^.*$', TemplateView.as_view(template_name='index.html')),
