@@ -1,7 +1,8 @@
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework import permissions
 from django.http import JsonResponse
+from django.views.generic import TemplateView
 
 # Simple API root view
 def api_root(request):
@@ -26,7 +27,7 @@ def api_root(request):
     })
 
 urlpatterns = [
-    path('', api_root),
+    path('', TemplateView.as_view(template_name='index.html'), name='frontend'),
     path('admin/', admin.site.urls),
     path('api-auth/', include('rest_framework.urls')),
     path('api/', api_root),
@@ -44,4 +45,7 @@ urlpatterns = [
     path('api/coordination/', include('coordination.urls')),
     path('api/ai/', include('ai_agent.urls')),
     path('api/audit-logs/', include('audit_logs.urls')),
+    
+    # Catch-all route to serve the SPA index.html for frontend sub-routing (e.g. /patients, /doctors)
+    re_path(r'^.*$', TemplateView.as_view(template_name='index.html')),
 ]
